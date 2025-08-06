@@ -1,5 +1,5 @@
 use argh::FromArgs;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tokio::process::Command;
@@ -24,6 +24,14 @@ struct Args {
   /// delay between initial task launches in milliseconds
   #[argh(option, short = 'd', default = "100")]
   delay: u64,
+
+  /// timeout for each task in seconds
+  #[argh(option)]
+  timeout: Option<u64>,
+
+  /// stop on first failure
+  #[argh(switch)]
+  stop_on_fail: bool,
 
   /// the command and its arguments to execute
   #[argh(positional, greedy)]
@@ -68,6 +76,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   let running_tasks = Arc::new(AtomicUsize::new(0));
   let successful_durations = Arc::new(Mutex::new(Vec::<Duration>::new())); // New: Store successful task durations
   let failed_durations = Arc::new(Mutex::new(Vec::<Duration>::new())); // New: Store failed task durations
+  let stop_spawning = Arc::new(AtomicBool::new(false));
 
   let mut task_id_counter = 0;
 
@@ -84,6 +93,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let running_tasks_clone = Arc::clone(&running_tasks);
     let successful_durations_clone = Arc::clone(&successful_durations);
     let failed_durations_clone = Arc::clone(&failed_durations);
+    let timeout_clone = args.timeout;
+    let stop_on_fail_clone = args.stop_on_fail;
+    let stop_spawning_clone = Arc::clone(&stop_spawning);
 
     join_set.spawn(async move {
       running_tasks_clone.fetch_add(1, Ordering::SeqCst);
@@ -96,7 +108,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       cmd.args(&cmd_args_clone);
 
       let task_start_time = Instant::now(); // Task start time
-      let output_result = cmd.output().await;
+      let output_result = if let Some(timeout_secs) = timeout_clone {
+        match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+          Ok(res) => res,
+          Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Task timed out")),
+        }
+      } else {
+        cmd.output().await
+      };
       let task_duration = task_start_time.elapsed(); // Task duration
 
       let (result_msg, stdout_output, stderr_output) = match output_result {
@@ -113,6 +132,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
           } else {
             failed_tasks_clone.fetch_add(1, Ordering::SeqCst);
+            if stop_on_fail_clone {
+              stop_spawning_clone.store(true, Ordering::SeqCst);
+            }
             failed_durations_clone.lock().unwrap().push(task_duration); // Store duration
             (
               format!("Failed (Exit Code: {})", output.status.code().unwrap_or_default()),
@@ -123,6 +145,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Err(e) => {
           failed_tasks_clone.fetch_add(1, Ordering::SeqCst);
+          if stop_on_fail_clone {
+            stop_spawning_clone.store(true, Ordering::SeqCst);
+          }
           failed_durations_clone.lock().unwrap().push(task_duration); // Store duration
           (format!("Error: {e}"), String::new(), String::new())
         }
@@ -161,6 +186,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
   while let Some(res) = join_set.join_next().await {
     let _finished_task_id = res?; // Handle potential panics in spawned tasks
 
+    if stop_spawning.load(Ordering::SeqCst) {
+      break;
+    }
+
     if task_id_counter < args.total_tasks {
       task_id_counter += 1;
       let task_id = task_id_counter;
@@ -173,6 +202,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
       let running_tasks_clone = Arc::clone(&running_tasks);
       let successful_durations_clone = Arc::clone(&successful_durations);
       let failed_durations_clone = Arc::clone(&failed_durations);
+      let timeout_clone = args.timeout;
+      let stop_on_fail_clone = args.stop_on_fail;
+      let stop_spawning_clone = Arc::clone(&stop_spawning);
 
       join_set.spawn(async move {
         running_tasks_clone.fetch_add(1, Ordering::SeqCst);
@@ -185,7 +217,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cmd.args(&cmd_args_clone);
 
         let task_start_time = Instant::now(); // Task start time
-        let output_result = cmd.output().await;
+        let output_result = if let Some(timeout_secs) = timeout_clone {
+          match tokio::time::timeout(Duration::from_secs(timeout_secs), cmd.output()).await {
+            Ok(res) => res,
+            Err(_) => Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "Task timed out")),
+          }
+        } else {
+          cmd.output().await
+        };
         let task_duration = task_start_time.elapsed(); // Task duration
 
         let (result_msg, stdout_output, stderr_output) = match output_result {
@@ -202,6 +241,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
               )
             } else {
               failed_tasks_clone.fetch_add(1, Ordering::SeqCst);
+              if stop_on_fail_clone {
+                stop_spawning_clone.store(true, Ordering::SeqCst);
+              }
               failed_durations_clone.lock().unwrap().push(task_duration); // Store duration
               (
                 format!("Failed (Exit Code: {})", output.status.code().unwrap_or_default()),
@@ -212,6 +254,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
           }
           Err(e) => {
             failed_tasks_clone.fetch_add(1, Ordering::SeqCst);
+            if stop_on_fail_clone {
+              stop_spawning_clone.store(true, Ordering::SeqCst);
+            }
             failed_durations_clone.lock().unwrap().push(task_duration); // Store duration
             (format!("Error: {e}"), String::new(), String::new())
           }
@@ -244,6 +289,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if completed_tasks.load(Ordering::SeqCst) == args.total_tasks {
       break;
     }
+  }
+
+  if stop_spawning.load(Ordering::SeqCst) {
+    println!("----------------------------------------");
+    println!("Execution stopped due to a task failure.");
+    join_set.abort_all();
   }
 
   let total_duration = start_time.elapsed(); // Overall end time
