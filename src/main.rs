@@ -1,4 +1,4 @@
-use clap::Parser;
+use argh::FromArgs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -6,33 +6,42 @@ use tokio::process::Command;
 use tokio::task::JoinSet;
 use tokio::time::{self, Duration, Instant};
 
-#[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[derive(FromArgs, Debug)]
+/// a command-pool to run multiple commands in parallel.
 struct Args {
-  /// Number of concurrent tasks
-  #[arg(short = 'c', long, default_value_t = 1)]
+  /// number of concurrent tasks
+  #[argh(option, short = 'c', default = "1")]
   concurrency: usize,
 
-  /// Total number of tasks to execute
-  #[arg(short = 'n', long)]
+  /// total number of tasks to execute
+  #[argh(option, short = 'n')]
   total_tasks: usize,
 
-  /// Hide some-command specific stdout output, only show task start/end info
-  #[arg(short = 'q', long)]
+  /// hide some-command specific stdout output, only show task start/end info
+  #[argh(switch, short = 'q')]
   quiet: bool,
 
-  /// Delay between initial task launches in milliseconds
-  #[arg(short = 'd', long, default_value_t = 100)]
+  /// delay between initial task launches in milliseconds
+  #[argh(option, short = 'd', default = "100")]
   delay: u64,
 
-  /// The command and its arguments to execute
-  #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+  /// the command and its arguments to execute
+  #[argh(positional, greedy)]
   command: Vec<String>,
+}
+
+fn format_duration_custom(duration: Duration) -> String {
+  let secs = duration.as_secs();
+  if secs >= 60 {
+    humantime::format_duration(Duration::from_secs(secs)).to_string()
+  } else {
+    format!("{:.2}s", duration.as_secs_f64())
+  }
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-  let args = Args::parse();
+  let args: Args = argh::from_env();
 
   if args.command.is_empty() {
     eprintln!("Error: No command provided to execute.");
@@ -260,9 +269,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let min_duration = successful_durations_locked.iter().min().unwrap();
     let max_duration = successful_durations_locked.iter().max().unwrap();
     println!("\nSuccessful Tasks Statistics:");
-    println!("  Average Duration: {}", humantime::format_duration(avg_duration));
-    println!("  Min Duration: {}", humantime::format_duration(*min_duration));
-    println!("  Max Duration: {}", humantime::format_duration(*max_duration));
+    println!("  Average Duration: {}", format_duration_custom(avg_duration));
+    println!("  Min Duration: {}", format_duration_custom(*min_duration));
+    println!("  Max Duration: {}", format_duration_custom(*max_duration));
   }
 
   // Report for failed tasks
@@ -273,15 +282,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let min_duration = failed_durations_locked.iter().min().unwrap();
     let max_duration = failed_durations_locked.iter().max().unwrap();
     println!("\nFailed Tasks Statistics:");
-    println!("  Average Duration: {}", humantime::format_duration(avg_duration));
-    println!("  Min Duration: {}", humantime::format_duration(*min_duration));
-    println!("  Max Duration: {}", humantime::format_duration(*max_duration));
+    println!("  Average Duration: {}", format_duration_custom(avg_duration));
+    println!("  Min Duration: {}", format_duration_custom(*min_duration));
+    println!("  Max Duration: {}", format_duration_custom(*max_duration));
   }
 
-  println!(
-    "\nTotal command-pool execution time: {}",
-    humantime::format_duration(total_duration)
-  );
+  println!("\nTotal command-pool execution time: {}", format_duration_custom(total_duration));
 
   Ok(())
 }
